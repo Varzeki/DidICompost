@@ -1,6 +1,7 @@
 package com.compost;
 
 import java.awt.Color;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumMap;
 import java.util.EnumSet;
@@ -11,7 +12,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -20,9 +20,11 @@ import net.runelite.api.Client;
 import net.runelite.api.Constants;
 import net.runelite.api.DynamicObject;
 import net.runelite.api.GameObject;
+import net.runelite.api.GameState;
 import net.runelite.api.GroundObject;
 import net.runelite.api.JagexColor;
 import net.runelite.api.Model;
+import net.runelite.api.Point;
 import net.runelite.api.Renderable;
 import net.runelite.api.RuneLiteObject;
 import net.runelite.api.Scene;
@@ -31,7 +33,6 @@ import net.runelite.api.Tile;
 import net.runelite.api.TileObject;
 import net.runelite.api.WorldView;
 import net.runelite.api.coords.LocalPoint;
-import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.hooks.DrawCallbacks;
 import net.runelite.client.callback.RenderCallback;
 
@@ -45,9 +46,11 @@ import net.runelite.client.callback.RenderCallback;
  * the model's own colours are put back as soon as the renderer moves on. The soil keeps any
  * texture the renderer gives it.
  * <p>
- * Renderers read models on several threads at once, so another thread could read a model while it
- * holds a composted patch's colours. Nothing waits for that; instead, such reads are noticed, and
- * the patches read are read again.
+ * Renderers read models on several threads at once. Threads reading a model share the colours it
+ * holds: they can read it together if they want the same colours, and otherwise one waits, briefly,
+ * for the others to finish. Rather than wait longer, it skips the object, and the zone is read again,
+ * as often as it takes for one reading to start after the skip. The renderer can drop a request to
+ * read a zone again, so the request is repeated until then.
  * <p>
  * Once planted, the soil of patches without mounds is the terrain, which is recoloured directly,
  * except where 117HD would blend it away: there, a flat quad of the soil's colour is laid over it.
@@ -102,11 +105,24 @@ class SoilRecolourer implements RenderCallback
 	private static final int QUAD_RADIUS = 60;
 
 	/**
-	 * How long a model may keep a composted patch's colours. The renderer reads it as soon as it's
-	 * coloured, but its thread only comes back to put it right at its next callback, which can be
-	 * much later; after this long they're put back for it.
+	 * How long a thread may share a model's colours. The renderer reads it straight away, but its
+	 * thread only comes back to let go at its next callback, which can be much later; after this long
+	 * it's let go for it.
 	 */
 	private static final long STALE_NANOS = 20_000_000;
+	/**
+	 * How long a thread waits for others to finish with a model before skipping it.
+	 */
+	private static final long WAIT_NANOS = 500_000;
+	/**
+	 * How long a thread reading a zone goes without reading anything before it's taken to have
+	 * finished with the zone; its next read of that zone is a new reading of it.
+	 */
+	private static final long READING_IDLE_NANOS = 50_000_000;
+	/**
+	 * How long to keep asking for a zone to be read again before giving up.
+	 */
+	private static final long REREAD_TIMEOUT_NANOS = 10_000_000_000L;
 
 	/**
 	 * How far from a patch's tile to look for the objects making it up.
@@ -121,7 +137,12 @@ class SoilRecolourer implements RenderCallback
 	 * The scene tiles {@link #soils} was found in; a new scene has fresh tiles.
 	 */
 	private Tile[][][] sceneTiles;
+	private Scene scene;
 	private boolean coloursChanged;
+	/**
+	 * Each patch's compost, as last given to the renderers.
+	 */
+	private final int[] compost = new int[FarmingPatches.values().length];
 
 	// used by the renderers, off the client thread
 
@@ -130,13 +151,10 @@ class SoilRecolourer implements RenderCallback
 	 */
 	private volatile short[] soilColours;
 	/**
-	 * Compost (1-3) of each composted mound tile, keyed by packed world point.
+	 * Compost (1-3) of each composted patch, keyed by object id. It doesn't depend on the scene, so
+	 * a patch has its colour from the first time a renderer reads it.
 	 */
-	private volatile Map<Integer, Integer> compostByTile = Collections.emptyMap();
-	/**
-	 * Compost (1-3) of each composted patch whose soil is in its own model, keyed by object id.
-	 */
-	private volatile Map<Integer, Integer> compostByPatchObject = Collections.emptyMap();
+	private volatile Map<Integer, Integer> compostByPatch = Collections.emptyMap();
 	/**
 	 * Each model seen, with its own colours and its colours for each compost.
 	 */
@@ -145,63 +163,121 @@ class SoilRecolourer implements RenderCallback
 	 * Object ids of every patch, any of whose models might be coloured.
 	 */
 	private static final Set<Integer> PATCH_OBJECTS = new HashSet<>();
+	/**
+	 * Object ids of the patches whose soil is in their own model.
+	 */
+	private static final Set<Integer> SOIL_IN_PATCH_MODEL_OBJECTS = new HashSet<>();
 
 	static
 	{
 		for (FarmingPatches patch : FarmingPatches.values())
 		{
 			PATCH_OBJECTS.add(patch.getPatchId());
+			if (SOIL_IN_PATCH_MODEL.contains(patch))
+			{
+				SOIL_IN_PATCH_MODEL_OBJECTS.add(patch.getPatchId());
+			}
 		}
 	}
 
-	/**
-	 * Set while a model holds a composted patch's colours; only one may at a time.
-	 */
-	private final AtomicBoolean colouring = new AtomicBoolean();
-	/**
-	 * Odd while a model holds a composted patch's colours, and changed whenever that starts or ends.
-	 */
-	private final AtomicLong version = new AtomicLong();
-	/**
-	 * The model holding a composted patch's colours, its own colours, and when it was coloured.
-	 */
-	private final Object colouredLock = new Object();
-	private Model colouredModel;
-	private Colours colouredOriginal;
-	private long colouredAt;
 	/**
 	 * What this thread last read, to check once the renderer has finished with it.
 	 */
 	private final ThreadLocal<Read> lastRead = new ThreadLocal<>();
 	/**
-	 * Zones the renderer may have read another patch's colours into, to have it read them again.
+	 * Each renderer thread's reading of a zone.
 	 */
-	private final Set<Integer> suspectZones = ConcurrentHashMap.newKeySet();
+	private final Map<Thread, Reading> readings = Collections.synchronizedMap(new WeakHashMap<>());
+	private final ThreadLocal<Reading> reading = ThreadLocal.withInitial(() ->
+	{
+		Reading r = new Reading();
+		readings.put(Thread.currentThread(), r);
+		return r;
+	});
+	/**
+	 * Zones to be read again, as the renderer may have read the wrong colours into them, with when
+	 * the latest reading that may have done so started: only a reading starting after it will do.
+	 */
+	private final Map<SceneZone, Suspect> suspects = new ConcurrentHashMap<>();
 
 	/**
-	 * A model read by the renderer: either coloured by this thread, or read while it might have
-	 * been holding another patch's colours (at {@code version}).
+	 * A model being read by the renderer, whose colours this thread shares until it's finished.
 	 */
 	private static final class Read
 	{
-		final int zone;
-		final long version;
-		final boolean coloured;
+		final ModelColours model;
+		final long generation;
+		final SceneZone zone;
+		final long readingStart;
 
-		Read(int zone, long version, boolean coloured)
+		Read(ModelColours model, long generation, SceneZone zone, long readingStart)
 		{
+			this.model = model;
+			this.generation = generation;
 			this.zone = zone;
-			this.version = version;
-			this.coloured = coloured;
+			this.readingStart = readingStart;
+		}
+	}
+
+	/**
+	 * A renderer thread reading one zone, tile by tile.
+	 */
+	private static final class Reading
+	{
+		volatile Scene scene;
+		volatile int zone;
+		volatile long start;
+		volatile long last;
+	}
+
+	/**
+	 * A zone of a particular scene; a zone of an older scene can't be read again.
+	 */
+	private static final class SceneZone
+	{
+		final Scene scene;
+		final int zone;
+
+		SceneZone(Scene scene, int zone)
+		{
+			this.scene = scene;
+			this.zone = zone;
+		}
+
+		@Override
+		public boolean equals(Object o)
+		{
+			return o instanceof SceneZone && ((SceneZone) o).scene == scene && ((SceneZone) o).zone == zone;
+		}
+
+		@Override
+		public int hashCode()
+		{
+			return System.identityHashCode(scene) * 31 + zone;
+		}
+	}
+
+	private static final class Suspect
+	{
+		/**
+		 * When the latest reading that may have read the wrong colours started, or the colours
+		 * changed.
+		 */
+		final long readingStart;
+		/**
+		 * When the zone was first to be read again.
+		 */
+		final long since;
+
+		Suspect(long readingStart, long since)
+		{
+			this.readingStart = readingStart;
+			this.since = since;
 		}
 	}
 
 	private static final class Soil
 	{
-		/**
-		 * The patch's mound tiles, as packed world points.
-		 */
-		final Set<Integer> tiles = new HashSet<>();
 		/**
 		 * The zones the patch is in, packed as {@code zx << 16 | zz}.
 		 */
@@ -306,21 +382,192 @@ class SoilRecolourer implements RenderCallback
 	}
 
 	/**
-	 * A model's own colours, and those colours with its soil recoloured for each compost.
+	 * A model's colours with its soil recoloured for each compost.
+	 */
+	private static final class SoilColours
+	{
+		final short[] soil;
+		final Colours[] colours = new Colours[3];
+
+		SoilColours(Colours original, short[] soil)
+		{
+			this.soil = soil;
+			for (int c = 0; c < 3; c++)
+			{
+				colours[c] = original.withSoil(soil[c]);
+			}
+		}
+	}
+
+	/**
+	 * A model, its own colours, and those colours with its soil recoloured for each compost, with
+	 * the threads sharing its colours.
+	 * <p>
+	 * Its state packs how many threads are sharing its colours (bits 0-15), which colours they are
+	 * (bits 16-17: its own, or a compost's), a bit set while its colours are being changed, and a
+	 * generation (bits 19 up) changed with its colours. With no threads, it has its own colours.
 	 */
 	private static final class ModelColours
 	{
-		final Colours original;
-		final Colours[] byCompost = new Colours[3];
-		final short[] soilColours;
+		static final long READERS = 0xFFFF;
+		static final int MODE_SHIFT = 16;
+		static final long WRITING = 1L << 18;
+		static final int GENERATION_SHIFT = 19;
 
-		ModelColours(Model model, short[] soilColours)
+		final Model model;
+		final Colours original;
+		final AtomicLong state = new AtomicLong();
+		volatile long sharedAt;
+		/**
+		 * This model's colours with each set of soil colours, by compost, most recent only.
+		 */
+		volatile SoilColours byCompost;
+		/**
+		 * The soil colours the model's colours were last changed to.
+		 */
+		volatile short[] sharedSoil;
+
+		ModelColours(Model model)
 		{
+			this.model = model;
 			this.original = new Colours(model);
-			this.soilColours = soilColours;
-			for (int c = 0; c < 3; c++)
+		}
+
+		/**
+		 * This model's colours with its soil recoloured for a compost, or null if it has no soil.
+		 */
+		Colours withSoil(int compost, short[] soilColours)
+		{
+			SoilColours byCompost = this.byCompost;
+			if (byCompost == null || byCompost.soil != soilColours)
 			{
-				byCompost[c] = original.withSoil(soilColours[c]);
+				byCompost = new SoilColours(original, soilColours);
+				this.byCompost = byCompost;
+			}
+			return byCompost.colours[compost - 1];
+		}
+
+		static long pack(long generation, int mode, long readers)
+		{
+			return generation << GENERATION_SHIFT | (long) mode << MODE_SHIFT | readers;
+		}
+
+		static int mode(long s)
+		{
+			return (int) (s >> MODE_SHIFT) & 3;
+		}
+
+		static long generation(long s)
+		{
+			return s >>> GENERATION_SHIFT;
+		}
+
+		/**
+		 * Share this model's colours for a compost (0 for its own), changing them if no thread is
+		 * sharing it. Waits at most {@link #WAIT_NANOS} for threads sharing other colours to finish.
+		 *
+		 * @return the generation shared, or -1 if it's still in use
+		 */
+		long share(int mode, Colours colours, short[] soil)
+		{
+			long deadline = 0;
+			for (;;)
+			{
+				long s = state.get();
+				if ((s & WRITING) == 0)
+				{
+					if (mode(s) == mode && (mode == 0 || sharedSoil == soil))
+					{
+						if (state.compareAndSet(s, s + 1))
+						{
+							sharedAt = System.nanoTime();
+							return generation(s);
+						}
+						continue;
+					}
+					if ((s & READERS) == 0 && state.compareAndSet(s, s | WRITING))
+					{
+						// with no threads sharing it, it has its own colours
+						colours.writeTo(model);
+						sharedSoil = soil;
+						long generation = generation(s) + 1;
+						sharedAt = System.nanoTime();
+						state.set(pack(generation, mode, 1));
+						return generation;
+					}
+				}
+
+				long now = System.nanoTime();
+				if (deadline == 0)
+				{
+					deadline = now + WAIT_NANOS;
+				}
+				else if (now > deadline)
+				{
+					return -1;
+				}
+				Thread.onSpinWait();
+			}
+		}
+
+		/**
+		 * Stop sharing this model's colours, putting its own colours back if it was the last thread
+		 * sharing a compost's.
+		 *
+		 * @return false if they were taken from this thread before it had finished with them
+		 */
+		boolean release(long generation)
+		{
+			for (;;)
+			{
+				long s = state.get();
+				if ((s & WRITING) != 0)
+				{
+					// another thread is changing its colours, which only takes a moment
+					Thread.onSpinWait();
+					continue;
+				}
+				if (generation(s) != generation)
+				{
+					return false;
+				}
+				if ((s & READERS) == 1 && mode(s) != 0)
+				{
+					if (state.compareAndSet(s, pack(generation, mode(s), 0) | WRITING))
+					{
+						original.writeTo(model);
+						state.set(pack(generation + 1, 0, 0));
+						return true;
+					}
+				}
+				else if (state.compareAndSet(s, s - 1))
+				{
+					return true;
+				}
+			}
+		}
+
+		/**
+		 * Take this model's colours from the threads sharing them, if they have for too long or
+		 * {@code all}, and put its own back.
+		 *
+		 * @return whether any were taken
+		 */
+		boolean revoke(boolean all)
+		{
+			for (;;)
+			{
+				long s = state.get();
+				if ((s & WRITING) != 0 || (s & READERS) == 0 || !all && System.nanoTime() - sharedAt <= STALE_NANOS)
+				{
+					return false;
+				}
+				if (state.compareAndSet(s, s | WRITING))
+				{
+					original.writeTo(model);
+					state.set(pack(generation(s) + 1, 0, 0));
+					return true;
+				}
 			}
 		}
 	}
@@ -355,73 +602,120 @@ class SoilRecolourer implements RenderCallback
 	}
 
 	/**
-	 * Bring each patch's soil in line with its compost. Must run on the client thread.
+	 * Bring each patch's soil in line with its compost. Must run on the client thread, every client
+	 * tick, so a new scene's terrain and quads follow as soon as it's shown.
 	 */
 	void update(boolean enabled)
 	{
+		if (soilColours == null)
+		{
+			return;
+		}
+
+		Set<FarmingPatches> changed = EnumSet.noneOf(FarmingPatches.class);
+		for (FarmingPatches patch : FarmingPatches.values())
+		{
+			int c = enabled ? client.getVarbitValue(patch.getCompostVarbit()) : 0;
+			if (compost[patch.ordinal()] != c)
+			{
+				compost[patch.ordinal()] = c;
+				changed.add(patch);
+			}
+		}
+		if (!changed.isEmpty())
+		{
+			Map<Integer, Integer> byPatch = new HashMap<>();
+			for (FarmingPatches patch : FarmingPatches.values())
+			{
+				if (compost[patch.ordinal()] != 0)
+				{
+					byPatch.put(patch.getPatchId(), compost[patch.ordinal()]);
+				}
+			}
+			compostByPatch = byPatch;
+		}
+
 		WorldView wv = client.getTopLevelWorldView();
-		if (wv == null || soilColours == null)
+		if (wv == null || client.getGameState() != GameState.LOGGED_IN)
 		{
 			return;
 		}
 
 		if (wv.getScene().getTiles() != sceneTiles)
 		{
-			// a new scene, uploaded without our colours
 			soils.values().forEach(SoilRecolourer::removeQuads);
 			soils.clear();
+			if (scene != null)
+			{
+				carryOverSuspects(scene, wv.getScene());
+			}
 			sceneTiles = wv.getScene().getTiles();
+			scene = wv.getScene();
 		}
 
-		boolean changed = false;
 		Set<Integer> zones = new HashSet<>();
-		Map<Integer, Integer> byPatchObject = new HashMap<>();
 		for (FarmingPatches patch : FarmingPatches.values())
 		{
-			int compost = enabled ? client.getVarbitValue(patch.getCompostVarbit()) : 0;
-			if (compost != 0 && SOIL_IN_PATCH_MODEL.contains(patch))
-			{
-				byPatchObject.put(patch.getPatchId(), compost);
-			}
-
+			int c = compost[patch.ordinal()];
 			Soil soil = soils.get(patch);
 			if (soil == null)
 			{
-				if (compost == 0 || (soil = find(wv, patch)) == null)
+				if (c == 0 || (soil = find(wv, patch)) == null)
 				{
 					continue;
 				}
 				soils.put(patch, soil);
+				// the renderer has given the patch its colour unless its compost has only just
+				// changed, but its terrain and quads are still to do
+				soil.compost = c;
+				colourTerrain(soil);
+				placeQuads(soil);
+				if (!soil.terrain.isEmpty() || changed.contains(patch))
+				{
+					zones.addAll(soil.zones);
+				}
 			}
-
-			if (soil.compost != compost || coloursChanged)
+			else if (soil.compost != c || coloursChanged)
 			{
-				soil.compost = compost;
+				soil.compost = c;
 				colourTerrain(soil);
 				placeQuads(soil);
 				zones.addAll(soil.zones);
-				changed = true;
 			}
 		}
 		coloursChanged = false;
 
-		if (changed)
+		// have the renderer read the patches again
+		long now = System.nanoTime();
+		for (int zone : zones)
 		{
-			Map<Integer, Integer> byTile = new HashMap<>();
-			for (Soil soil : soils.values())
+			reread(new SceneZone(wv.getScene(), zone), now);
+		}
+	}
+
+	/**
+	 * The renderer can carry a zone over from the last scene as it was, so have zones of the last
+	 * scene still to be read again read again in this one.
+	 */
+	private void carryOverSuspects(Scene from, Scene to)
+	{
+		int dx = (from.getBaseX() - to.getBaseX()) >> 3;
+		int dy = (from.getBaseY() - to.getBaseY()) >> 3;
+		int zones = Constants.EXTENDED_SCENE_SIZE >> 3;
+		long now = System.nanoTime();
+		for (SceneZone zone : suspects.keySet())
+		{
+			if (zone.scene != from)
 			{
-				if (soil.compost != 0)
-				{
-					for (int tile : soil.tiles)
-					{
-						byTile.put(tile, soil.compost);
-					}
-				}
+				continue;
 			}
-			compostByTile = byTile;
-			compostByPatchObject = byPatchObject;
-			// have the renderer read the patches again
-			invalidate(wv.getScene(), zones);
+			suspects.remove(zone);
+			int zx = (zone.zone >> 16) + dx;
+			int zz = (zone.zone & 0xFFFF) + dy;
+			if (zx >= 0 && zx < zones && zz >= 0 && zz < zones)
+			{
+				reread(new SceneZone(to, zx << 16 | zz), now);
+			}
 		}
 	}
 
@@ -430,8 +724,8 @@ class SoilRecolourer implements RenderCallback
 	 */
 	void clear()
 	{
-		compostByTile = Collections.emptyMap();
-		compostByPatchObject = Collections.emptyMap();
+		compostByPatch = Collections.emptyMap();
+		Arrays.fill(compost, 0);
 		WorldView wv = client.getTopLevelWorldView();
 		if (wv != null && wv.getScene().getTiles() == sceneTiles)
 		{
@@ -447,10 +741,11 @@ class SoilRecolourer implements RenderCallback
 		soils.values().forEach(SoilRecolourer::removeQuads);
 		soils.clear();
 		sceneTiles = null;
+		scene = null;
 
 		// a renderer thread may not have come back to put its colours right
-		putBack(0);
-		suspectZones.clear();
+		revoke(true);
+		suspects.clear();
 	}
 
 	/**
@@ -526,26 +821,42 @@ class SoilRecolourer implements RenderCallback
 	}
 
 	/**
-	 * Put back colours a renderer thread has left in a model too long, and have zones that may
-	 * have been read with the wrong colours read again. Must run on the client thread.
+	 * Put back colours a renderer thread has left in a model too long, and ask again for zones
+	 * that may have been read with the wrong colours to be read again. Must run on the client
+	 * thread, every client tick.
 	 */
 	void tick()
 	{
-		synchronized (colouredLock)
+		revoke(false);
+
+		long now = System.nanoTime();
+		synchronized (readings)
 		{
-			if (colouredModel != null && System.nanoTime() - colouredAt > STALE_NANOS)
+			for (Reading r : readings.values())
 			{
-				putBack(0);
+				if (r.scene != null && now - r.last > READING_IDLE_NANOS)
+				{
+					r.scene = null;
+				}
 			}
 		}
 
 		WorldView wv = client.getTopLevelWorldView();
-		if (wv != null && !suspectZones.isEmpty())
+		DrawCallbacks dc = client.getDrawCallbacks();
+		Scene current = wv == null ? null : wv.getScene();
+		suspects.forEach((zone, suspect) ->
 		{
-			Set<Integer> zones = new HashSet<>(suspectZones);
-			suspectZones.removeAll(zones);
-			invalidate(wv.getScene(), zones);
-		}
+			if (now - suspect.since > REREAD_TIMEOUT_NANOS)
+			{
+				log.debug("Gave up having zone {},{} read again", zone.zone >> 16, zone.zone & 0xFFFF);
+				suspects.remove(zone, suspect);
+			}
+			else if (zone.scene == current && dc != null)
+			{
+				// the renderer ignores this while the zone is already to be read again
+				dc.invalidateZone(current, zone.zone >> 16, zone.zone & 0xFFFF);
+			}
+		});
 	}
 
 	@Override
@@ -553,6 +864,23 @@ class SoilRecolourer implements RenderCallback
 	{
 		// the renderer has finished with the previous tile's objects
 		finishRead();
+
+		Reading r = reading.get();
+		long now = System.nanoTime();
+		Point p = tile.getSceneLocation();
+		int zone = zone(p.getX(), p.getY());
+		if (r.scene != scene || r.zone != zone)
+		{
+			// a new reading of this zone, which is all it takes for it to have been read again
+			r.scene = scene;
+			r.zone = zone;
+			r.start = now;
+			if (!suspects.isEmpty())
+			{
+				suspects.computeIfPresent(new SceneZone(scene, zone), (z, s) -> s.readingStart < now ? null : s);
+			}
+		}
+		r.last = now;
 		return true;
 	}
 
@@ -563,16 +891,21 @@ class SoilRecolourer implements RenderCallback
 
 		Integer compost;
 		Renderable renderable;
+		int zone;
 		if (object instanceof GameObject && PATCH_OBJECTS.contains(object.getId()))
 		{
-			compost = compostByPatchObject.get(object.getId());
+			compost = SOIL_IN_PATCH_MODEL_OBJECTS.contains(object.getId()) ? compostByPatch.get(object.getId()) : null;
 			renderable = ((GameObject) object).getRenderable();
+			// it's in the zone of the tile it's drawn from
+			Point min = ((GameObject) object).getSceneMinLocation();
+			zone = zone(min.getX(), min.getY());
 		}
 		else if (object instanceof GroundObject && object.getId() == MOUNDS)
 		{
 			LocalPoint lp = object.getLocalLocation();
-			compost = compostByTile.get(pack(scene.getBaseX() + lp.getSceneX(), scene.getBaseY() + lp.getSceneY(), object.getPlane()));
+			compost = moundCompost(scene, lp.getSceneX(), lp.getSceneY(), object.getPlane());
 			renderable = ((GroundObject) object).getRenderable();
+			zone = zone(lp.getSceneX(), lp.getSceneY());
 		}
 		else
 		{
@@ -590,65 +923,81 @@ class SoilRecolourer implements RenderCallback
 			return true;
 		}
 
-		LocalPoint lp = object.getLocalLocation();
-		int zone = (((lp.getSceneX() + EXTENDED_OFFSET) >> 3) << 16) | ((lp.getSceneY() + EXTENDED_OFFSET) >> 3);
-		if (compost == null)
+		ModelColours colours;
+		synchronized (models)
 		{
-			// check afterwards whether another patch's colours could have been in the model
-			lastRead.set(new Read(zone, version.get(), false));
+			// a model's first seen while no thread shares it, so with its own colours
+			colours = models.computeIfAbsent(model, ModelColours::new);
 		}
-		else if (colouring.compareAndSet(false, true))
+		Colours soil = compost == null ? null : colours.withSoil(compost, soilColours);
+		int mode = soil == null ? 0 : compost;
+
+		SceneZone sceneZone = new SceneZone(scene, zone);
+		long readingStart = reading.get().start;
+		long generation = colours.share(mode, soil, soilColours);
+		if (generation < 0)
 		{
-			colour(model, compost, soilColours, zone);
+			// rather than read it with the wrong colours, skip it and read the zone again
+			reread(sceneZone, readingStart);
+			return false;
 		}
-		else
-		{
-			// another patch's colours are in a model: this one will have to be read again
-			suspectZones.add(zone);
-		}
+		lastRead.set(new Read(colours, generation, sceneZone, readingStart));
 		return true;
 	}
 
 	/**
-	 * Colour the soil faces of a model the renderer is about to read. Only called by the thread
-	 * that has set {@link #colouring}, so no model holds any other patch's colours.
+	 * Take every model's colours from threads that have shared them too long, or from all threads.
 	 */
-	private void colour(Model model, int compost, short[] soilColours, int zone)
+	private void revoke(boolean all)
 	{
-		ModelColours colours;
 		synchronized (models)
 		{
-			colours = models.get(model);
-			if (colours == null || colours.soilColours != soilColours)
+			for (ModelColours colours : models.values())
 			{
-				colours = new ModelColours(model, soilColours);
-				models.put(model, colours);
+				colours.revoke(all);
 			}
 		}
-
-		Colours soil = colours.byCompost[compost - 1];
-		if (soil == null)
-		{
-			colouring.set(false);
-			return;
-		}
-
-		long v;
-		synchronized (colouredLock)
-		{
-			colouredModel = model;
-			colouredOriginal = colours.original;
-			colouredAt = System.nanoTime();
-			// odd from before the colours are written until after they're put back
-			v = version.incrementAndGet();
-			soil.writeTo(model);
-		}
-		lastRead.set(new Read(zone, v, true));
 	}
 
 	/**
-	 * Now the renderer has finished with what this thread last read: put back any colours this
-	 * thread wrote, or if another patch's colours could have been read, have it read again.
+	 * The compost of the patch a mound is part of, if it's composted.
+	 */
+	private Integer moundCompost(Scene scene, int sceneX, int sceneY, int plane)
+	{
+		Tile[][][] tiles = scene.getExtendedTiles();
+		int x = sceneX + EXTENDED_OFFSET;
+		int y = sceneY + EXTENDED_OFFSET;
+		if (plane < 0 || plane >= tiles.length || x < 0 || x >= tiles[plane].length || y < 0 || y >= tiles[plane][x].length
+			|| tiles[plane][x][y] == null)
+		{
+			return null;
+		}
+
+		Map<Integer, Integer> compostByPatch = this.compostByPatch;
+		for (GameObject object : tiles[plane][x][y].getGameObjects())
+		{
+			Integer compost = object == null ? null : compostByPatch.get(object.getId());
+			if (compost != null)
+			{
+				return compost;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Have a zone read again, by a reading starting after {@code readingStart}.
+	 */
+	private void reread(SceneZone zone, long readingStart)
+	{
+		long now = System.nanoTime();
+		suspects.merge(zone, new Suspect(readingStart, now),
+			(old, s) -> new Suspect(Math.max(old.readingStart, s.readingStart), old.since));
+	}
+
+	/**
+	 * Now the renderer has finished with what this thread last read, stop sharing its colours; if
+	 * they were taken first, have it read again.
 	 */
 	private void finishRead()
 	{
@@ -659,43 +1008,23 @@ class SoilRecolourer implements RenderCallback
 		}
 		lastRead.remove();
 
-		if (read.coloured)
+		if (!read.model.release(read.generation))
 		{
-			putBack(read.version);
-		}
-		else if ((read.version & 1) != 0 || version.get() != read.version)
-		{
-			suspectZones.add(read.zone);
+			reread(read.zone, read.readingStart);
 		}
 	}
 
 	/**
-	 * Put back the colours of the coloured model, if it was coloured at {@code at} or {@code at} is 0.
+	 * The zone a scene tile is in, packed as {@code zx << 16 | zz}.
 	 */
-	private void putBack(long at)
+	private static int zone(int sceneX, int sceneY)
 	{
-		synchronized (colouredLock)
-		{
-			if (colouredModel == null || at != 0 && version.get() != at)
-			{
-				return;
-			}
-			colouredOriginal.writeTo(colouredModel);
-			colouredModel = null;
-			colouredOriginal = null;
-			version.incrementAndGet();
-			colouring.set(false);
-		}
-	}
-
-	private static int pack(int x, int y, int plane)
-	{
-		return (plane << 28) | ((x & 0x3FFF) << 14) | (y & 0x3FFF);
+		return (((sceneX + EXTENDED_OFFSET) >> 3) << 16) | ((sceneY + EXTENDED_OFFSET) >> 3);
 	}
 
 	/**
-	 * Find the zones a patch is in (it's sometimes several objects sharing an id), with its mound
-	 * tiles, or for a patch without mounds, its soil terrain.
+	 * Find the zones a patch is in (it's sometimes several objects sharing an id), and for a patch
+	 * without mounds, its soil terrain.
 	 */
 	private static Soil find(WorldView wv, FarmingPatches patch)
 	{
@@ -722,7 +1051,7 @@ class SoilRecolourer implements RenderCallback
 					continue;
 				}
 				found = true;
-				int zone = (((x + EXTENDED_OFFSET) >> 3) << 16) | ((y + EXTENDED_OFFSET) >> 3);
+				int zone = zone(x, y);
 
 				if (SOIL_IN_PATCH_MODEL.contains(patch))
 				{
@@ -743,16 +1072,17 @@ class SoilRecolourer implements RenderCallback
 				GroundObject ground = tile.getGroundObject();
 				if (ground != null && ground.getId() == MOUNDS)
 				{
-					WorldPoint wp = tile.getWorldLocation();
-					soil.tiles.add(pack(wp.getX(), wp.getY(), wp.getPlane()));
 					soil.zones.add(zone);
 				}
 			}
 		}
-		log.debug("{}: {} mound tiles, {} terrain tiles, {} quad tiles, in {} zones", patch, soil.tiles.size(), soil.terrain.size(),
-			soil.quadTiles.size(), soil.zones.size());
-		// not found means not loaded yet, so look again later
-		return found ? soil : null;
+		if (!found)
+		{
+			// not loaded yet, so look again later
+			return null;
+		}
+		log.debug("{}: {} terrain tiles, {} quad tiles, in {} zones", patch, soil.terrain.size(), soil.quadTiles.size(), soil.zones.size());
+		return soil;
 	}
 
 	private static boolean hasObject(Tile tile, int id)

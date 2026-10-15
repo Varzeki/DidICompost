@@ -3,7 +3,6 @@ package com.compost;
 import com.google.inject.Provides;
 import javax.inject.Inject;
 import net.runelite.api.events.ClientTick;
-import net.runelite.api.events.GameTick;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.callback.RenderCallbackManager;
 import net.runelite.client.config.ConfigManager;
@@ -36,6 +35,8 @@ public class DidICompostPlugin extends Plugin
 	@Inject
 	private DidICompostConfig config;
 
+	private boolean soil;
+
 	@Subscribe
 	public void onConfigChanged(ConfigChanged event)
 	{
@@ -52,32 +53,23 @@ public class DidICompostPlugin extends Plugin
 		{
 			clientThread.invokeLater(() ->
 			{
-				setSoilColours();
-				updateSoil();
+				loadSoilConfig();
+				soilRecolourer.update(soil);
 			});
 		}
 	}
 
 	@Subscribe
-	public void onGameTick(GameTick event)
-	{
-		updateSoil();
-	}
-
-	@Subscribe
 	public void onClientTick(ClientTick event)
 	{
+		soilRecolourer.update(soil);
 		soilRecolourer.tick();
 	}
 
-	private void setSoilColours()
+	private void loadSoilConfig()
 	{
+		soil = config.displayMode().isSoil();
 		soilRecolourer.setColours(config.compostColour(), config.supercompostColour(), config.ultracompostColour());
-	}
-
-	private void updateSoil()
-	{
-		soilRecolourer.update(config.displayMode().isSoil());
 	}
 
 	@Override
@@ -86,7 +78,7 @@ public class DidICompostPlugin extends Plugin
 		overlayManager.add(patchOverlay);
 		patchOverlay.updateImages();
 		renderCallbackManager.register(soilRecolourer);
-		clientThread.invokeLater(this::setSoilColours);
+		clientThread.invokeLater(this::loadSoilConfig);
 	}
 
 	@Override
